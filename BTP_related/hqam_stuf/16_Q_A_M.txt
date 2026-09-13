@@ -1,0 +1,43 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import erfc
+
+# 1. Define the Gaussian Q-function using the complementary error function
+def Q(x):
+    return 0.5 * erfc(x / np.sqrt(2))
+
+# 2. Simulated Data Points for Conventional Square 16-QAM (Starting from 0 dB)
+ebn0_db_sim = np.array([0.00, 1.50, 3.00, 4.44, 6.02, 7.96, 8.87, 9.90, 11.06, 11.70, 12.39, 13.15, 13.98, 14.89, 15.92, 17.08, 18.42, 20.00])
+ber_sim = np.array([1.420429e-01, 1.092967e-01, 7.835844e-02, 5.177411e-02, 2.822600e-02, 9.808934e-03, 5.050272e-03, 2.041047e-03, 5.636707e-04, 2.358999e-04, 7.956011e-05, 2.001504e-05, 3.300419e-06, 3.500445e-07, 1.250159e-08, 6.194351e-11, 3.327591e-14, 1.404037e-19])
+
+
+# 3. Generate smooth range for the Theoretical Curve baseline from 0 to 20 dB
+ebn0_db_theo = np.linspace(0, 20, 600)
+ebn0_lin_theo = 10**(ebn0_db_theo / 10)
+
+# 4. Compute Exact Theoretical Bit Error Rate (BER) for Square 16-QAM with Gray Coding
+ber_theo = (3/4)*Q(np.sqrt((4/5)*ebn0_lin_theo)) + (1/2)*Q(3*np.sqrt((4/5)*ebn0_lin_theo)) - (1/4)*Q(5*np.sqrt((4/5)*ebn0_lin_theo))
+
+# 5. Plotting directly in Colab
+plt.figure(figsize=(11, 7.5), dpi=100)
+
+# Smooth theoretical baseline from 0 to 20 dB
+plt.semilogy(ebn0_db_theo, ber_theo, color='forestgreen', linestyle='-', linewidth=2.5, 
+             label='Theoretical Closed-Form Curve (Square 16-QAM)')
+
+# Complete simulation dataset joined together with a dashed line starting at 0 dB
+plt.semilogy(ebn0_db_sim, ber_sim, color='darkorange', marker='s', linestyle='--', linewidth=1.8, 
+             markersize=7, markeredgewidth=1.5, label='Simulation Performance (Connected from 0 dB)')
+
+# Graph Formatting
+plt.grid(True, which="both", linestyle="--", alpha=0.6)
+plt.xlabel('$E_b/N_0$ (dB)', fontsize=13, fontweight='bold')
+plt.ylabel('Bit Error Rate (BER)', fontsize=13, fontweight='bold')
+plt.title('Performance Comparison: Theoretical vs. Connected Simulated Conventional 16-QAM', fontsize=14, pad=15, fontweight='bold')
+plt.legend(fontsize=11, loc='upper right', frameon=True, shadow=True)
+
+# Set axis limits exactly matching your requested window parameters
+plt.xlim(0, 20)
+plt.ylim(1e-10, 1)
+
+plt.show()

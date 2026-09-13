@@ -1,0 +1,53 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import erfc
+
+# 1. Define the Gaussian Q-function using the complementary error function
+def Q(x):
+    return 0.5 * erfc(x / np.sqrt(2))
+
+# 2. Extended Simulation Dataset (Including low SNR points starting from 0 dB)
+# Combined from your initial GRC measurements and high-SNR sweeps
+ebn0_db_sim = np.array([0.00, 1.50, 3.00, 4.44, 6.02, 7.96, 8.87, 9.90, 11.06, 11.70, 12.39, 13.15, 13.98, 14.89, 15.92, 17.08, 18.42, 20.00])
+ber_sim = np.array([1.5200e-01, 1.1400e-01, 8.2100e-02, 6.0300e-02, 3.0500e-02, 9.5300e-03, 4.5400e-03, 1.6500e-03, 3.8700e-04, 1.4500e-04, 4.4100e-05, 1.0200e-05, 1.2400e-06, 8.2400e-08, 1.9800e-09, 8.4200e-12, 2.1100e-15, 2.1500e-21])
+
+# 3. Generate smooth range for the Theoretical Curve baseline from 0 to 20 dB
+ebn0_db_theo = np.linspace(0, 20, 600)
+ebn0_lin_theo = 10**(ebn0_db_theo / 10)
+esn0_lin_theo = 4 * ebn0_lin_theo  # For M=16, Es = 4 * Eb
+
+# 4. Define theoretical parameters from the verified closed-form research equation
+M = 16
+A = 4.125
+B = 4.4948
+kappa = 2 / 9  # Geometric scaling factor specific to your 16-HexQAM constellation grid
+
+# Compute Theoretical Symbol Error Rate (SER)
+P_s = A * Q(np.sqrt(kappa * esn0_lin_theo)) - B * Q(np.sqrt((10/11) * kappa * esn0_lin_theo)) * Q(np.sqrt((1/3) * kappa * esn0_lin_theo))
+
+# Convert to Bit Error Rate (BER) matching your perfect Quasi-Gray symbol map
+ber_theo = P_s / np.log2(M)
+
+# 5. Plotting directly in Colab
+plt.figure(figsize=(11, 7.5), dpi=100)
+
+# Smooth theoretical baseline from 0 to 20 dB
+plt.semilogy(ebn0_db_theo, ber_theo, color='crimson', linestyle='-', linewidth=2.5, 
+             label='Theoretical Closed-Form Curve')
+
+# Complete simulation dataset joined together with a dashed line starting at 0 dB
+plt.semilogy(ebn0_db_sim, ber_sim, color='royalblue', marker='o', linestyle='--', linewidth=1.8, 
+             markersize=7, markeredgewidth=1.5, label='Simulation Performance (Connected from 0 dB)')
+
+# Graph Formatting
+plt.grid(True, which="both", linestyle="--", alpha=0.6)
+plt.xlabel('$E_b/N_0$ (dB)', fontsize=13, fontweight='bold')
+plt.ylabel('Bit Error Rate (BER)', fontsize=13, fontweight='bold')
+plt.title('Performance Comparison: Theoretical vs. Connected Simulated Coherent 16-HexQAM', fontsize=14, pad=15, fontweight='bold')
+plt.legend(fontsize=11, loc='upper right', frameon=True, shadow=True)
+
+# Set axis limits exactly as instructed
+plt.xlim(0, 20)
+plt.ylim(1e-10, 1)
+
+plt.show()

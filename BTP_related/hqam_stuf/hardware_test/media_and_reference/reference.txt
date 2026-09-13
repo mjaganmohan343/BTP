@@ -1,0 +1,229 @@
+Implementing an over-the-air (OTA) audio transceiver system between two USRP B210s using **16 Hexagonal QAM (16 Hex-QAM)** in GNU Radio is an excellent project. Hex-QAM provides a tighter packing density than standard rectangular 16-QAM, offering an approximate 0.6 dB power efficiency gain (packing gain), but it introduces unique challenges in synchronization and constellation mapping.
+
+Here is a comprehensive overview of the system architecture, along with the specific OTA challenges and how to solve them in GNU Radio Companion (GRC).
+
+---
+
+## System Architecture Overview
+
+To transmit audio over the air, your GNU Radio setup must be split into a Transmitter (TX) flowgraph on one machine and a Receiver (RX) flowgraph on another.
+
+### 1. The Transmitter Chain
+
+* **Audio Source:** Captures raw audio (typically at $44.1 \text{ kHz}$ or $48 \text{ kHz}$).
+* **Packetization / Framing:** Converts the floating-point audio data into tagged stream bytes. Because an OTA channel drops data, you must wrap raw bytes into packets using blocks like **Stream to Tagged Stream** and **Protocol Formatter** to append preambles and CRCs.
+* **16 Hex-QAM Constellation Modulator:** Instead of using the default rectangular QAM block, you must use a custom **Digital Constellation Object** defined by a custom list of 16 complex coordinates corresponding to a hexagonal grid. A **Constellation Modulator** maps 4 bits to one of these 16 hex points.
+* **Pulse Shaping & Resampling:** An **RRC (Root Raised Cosine) Filter** limits signal bandwidth and cuts down Inter-Symbol Interference (ISI). A **Rational Resampler** interpolates the sample rate up to a rate stable for the USRP.
+* **UHD: USRP Sink:** Takes the complex baseband samples, upconverts them to your chosen RF carrier frequency (e.g., $2.4 \text{ GHz}$), and transmits them over the air.
+
+### 2. The Receiver Chain
+
+* **UHD: USRP Source:** Captures the over-the-air RF signal and downconverts it to baseband complex samples.
+* **AGC (Automatic Gain Control):** Norms the incoming signal amplitude. Because QAM depends heavily on precise amplitude levels, this block is vital.
+* **Timing & Carrier Recovery:** A **Symbol Sync** block locks onto the symbol clock. A **Decision-Directed Carrier Tracking** loop eliminates phase and frequency drift.
+* **Constellation Decoder:** Maps the corrected complex symbols back to bits/bytes using your custom Hex-QAM constellation object.
+* **Packet Parsing & Audio Sink:** The **Header/Payload Demux** extracts the audio payload, discards corrupted packets via CRC check, converts bytes back to floats, and sends the stream to the **Audio Sink** (speakers).
+
+---
+
+## Core Challenges and Solutions
+
+### 1. Custom Constellation Mapping & Slicing
+
+* **The Challenge:** GNU Radio does not have a built-in "Hexagonal" preset dropdown. Standard rectangular QAM relies on a simple slicing grid (odd integer coordinates like $\pm1, \pm3$). Hex-QAM relies on an equilateral triangle lattice where constellation points have offset rows, making standard slicing math fail.
+* **The Solution:** Define a custom `digital.constellation_receiver` or `digital.constellation_decoder` object in GRC. You must manually feed it a list of 16 complex numbers calculated using hexagonal packing (e.g., generated via a Python snippet using the basis vectors $v_1 = 1$ and $v_2 = 0.5 + j\frac{\sqrt{3}}{2}$). Set the decision maker type to **Voronoi** or **Nearest Neighbor** so GNU Radio automatically calculates the boundaries mathematically rather than assuming a grid.
+
+### 2. Carrier Frequency Offset (CFO) and Phase Rotation
+
+* **The Challenge:** The TX and RX USRP B210s use independent local oscillators. Even a tiny mismatch (e.g., 2 ppm at $2.4 \text{ GHz}$ is $4.8 \text{ kHz}$ of offset) will cause the received 16 Hex-QAM constellation to rapidly spin in circles, blending the 16 distinct points into unreadable rings.
+* **The Solution:** You cannot use a standard square Costas Loop because it relies on $90^\circ$ quadrant symmetry, which Hex-QAM lacks. Instead, use a **Constant Modulus Algorithm (CMA) Equalizer** or a **Linear Equalizer** to pre-converge the constellation, followed by a decision-directed phase locked loop (PLL). Alternatively, if testing in a lab setting, physically lock the two USRPs together using a shared 10 MHz reference clock or GPSDOs to bypass CFO altogether.
+
+### 3. High Sensitivity to Amplitude Fluctuations
+
+* **The Challenge:** Unlike phase-only modulations like QPSK, 16-QAM encodes information in *both* amplitude and phase. In an over-the-air environment, multipath fading and distance change the signal's amplitude drastically, pushing outer ring hex points into inner ring locations.
+* **The Solution:** Place an aggressive **AGC block** right after your USRP source. Furthermore, utilize a pilot-signal or a **Linear Equalizer (LMS)** initialized with your exact custom Hex-QAM constellation to continuously track and correct the channel's gain and phase distortion over time.
+
+### 4. Sample Rate Mismatch (Audio vs. RF Hardware)
+
+* **The Challenge:** Your audio hardware streams at a low rate (e.g., $44.1 \text{ kHz}$). However, the USRP B210 struggles with low sample rates over USB 3.0; running a B210 below $1 \text{ MSps}$ often results in buffer underflows (`U`) or overflows (`O`), which will destroy your audio synchronization.
+* **The Solution:** Decouple your audio rate from your symbol rate using **Rational Resampler** blocks. For example, scale your audio data up to a symbol rate of $250 \text{ kSym/s}$. With 4 samples per symbol (SPS), your USRP sample rate will sit at a perfectly stable $1 \text{ MSps}$.
+
+### 5. Burst Error Propagation in Streaming Audio
+
+* **The Challenge:** Audio is a continuous bitstream. Over the air, if even a single bit is dropped or added during demodulation, the entire bitstream shifts. This causes your receiver to decode parts of the next sample as part of the current one, completely destroying the audio and outputting loud static.
+* **The Solution:** Frame your audio data into packets. Use GNU Radio's **Tagged Stream** blocks. By sending data in bursts wrapped with a preamble, the receiver can re-synchronize its byte alignment at the start of every single packet. If a packet contains an error, the CRC fails, and the packet is dropped or muted instead of turning into loud static.
+
+---
+
+
+Yes, it is **absolutely possible** to synchronize the two USRP B210s over the air at 2.5 GHz without an external reference clock or GPSDO. In fact, this is exactly how real-world commercial systems like Wi-Fi and LTE operate—they cannot share a physical clock cable, so the entire synchronization process is handled purely via digital signal processing (DSP).
+
+However, when it comes to resolving phase ambiguity, **you should not use differential encoding** for a 16 Hex-QAM system.
+
+Here is the breakdown of why it is possible, how to implement the synchronization, and why differential encoding is the wrong tool for a hexagonal constellation.
+
+---
+
+## Over-the-Air Sync at 2.5 GHz (Without Shared Clocks)
+
+The built-in Temperature Compensated Crystal Oscillator (TCXO) on the USRP B210 has a frequency stability rating of approximately $\pm2\text{ ppm}$ (parts per million).
+
+When operating at a carrier frequency ($f_c$) of 2.5 GHz, a 2 ppm frequency error translates to a maximum offset per device:
+
+$$\text{Offset} = 2.5 \times 10^9\text{ Hz} \times 2 \times 10^{-6} = 5000\text{ Hz}$$
+
+In a worst-case scenario where the transmitter drifts +2 ppm and the receiver drifts -2 ppm, you will experience a total relative **Carrier Frequency Offset (CFO) of up to 10 kHz**. Over the air, this 10 kHz offset will cause your 16 Hex-QAM constellation to spin rapidly at 10,000 rotations per second, completely blowing out your symbol decisions.
+
+### The DSP Solution in GNU Radio
+
+To track out this 10 kHz offset entirely in software, your receiver chain needs a two-stage synchronization approach:
+
+1. **Coarse Frequency Tracking (Frequency Locked Loop):** Insert an **FLL Band-Edge** block right after your low-pass filtering or AGC. The FLL handles large frequency offsets (up to tens of kilohertz) by looking at the sharp spectral roll-off edges of your modulated signal. It will pull that 10 kHz offset down to just a few hertz.
+2. **Fine Phase and Frequency Tracking (Adaptive Equalization):** Once the FLL handles the heavy lifting, pass the samples through a **CMA (Constant Modulus Algorithm)** or **LMS (Least Mean Squares)** linear equalizer. Because Hex-QAM is highly sensitive to asymmetric phase rotations, an adaptive equalizer initialized with your custom hexagonal constellation grid will continuously adapt its filter taps to lock the constellation points firmly into place.
+
+---
+
+## Should You Use Differential Encoding?
+
+**Short answer: No.** Differential encoding is excellent for constellations with clean, quadrant-based rotational symmetry—like BPSK, QPSK, or standard rectangular M-QAM. In those schemes, if the carrier tracking loop locks onto the constellation with a $90^\circ$ or $180^\circ$ phase rotation (known as phase ambiguity), differential encoding protects the data because it maps information to the *difference* between consecutive phases rather than the absolute phase angle.
+
+### Why It Fails for Hexagonal QAM
+
+* **Lack of $90^\circ$ Quadrant Symmetry:** Hexagonal packing is built on an equilateral triangular lattice. It exhibits $60^\circ$ or $180^\circ$ rotational symmetry depending on how the 16 points are cropped from the infinite lattice. Mapping a 4-bit symbol (16 states) to relative phase transitions on a non-orthogonal hexagonal grid is geometrically complex and is not natively supported by any standard GNU Radio differential blocks.
+* **The Noise Penalty:** Differential decoding inherently doubles your Bit Error Rate (BER). If one symbol is corrupted by over-the-air noise, *two* consecutive symbols are decoded incorrectly at the output. Given that 16 Hex-QAM is already highly sensitive to amplitude and phase variations, adding a baseline noise penalty is highly inefficient.
+
+### The Standard Alternative: Preamble-Based Frame Sync
+
+Instead of differential encoding, you should use **framed packet transmission with a known preamble** (such as a Barker sequence or a short PN sequence) mapped to a simple, robust modulation like BPSK.
+
+* **How it works:** You prepend this known sequence to your audio data block at the transmitter.
+* **At the Receiver:** You use the **Correlate Access Code** block. The receiver continuously correlates incoming samples against the known preamble.
+* **Resolving Ambiguity:** When the correlation peak hits, the receiver determines the *exact* start of the packet and calculates the absolute phase shift introduced by the channel. It then applies this fixed phase correction to the entire following 16 Hex-QAM payload block, completely bypassing phase ambiguity without any bit-error penalty.
+
+
+Testing with pseudo-random bits first is the definitive gold standard for RF engineering. It completely isolates your physical layer (PHY) and synchronization DSP from any packetization or audio codec bugs. If you can't get a clean, locked constellation sink with random bits, streaming audio will never work.
+
+Here is the exact step-by-step workflow to calibrate your over-the-air 16 Hex-QAM transceiver using a random source.
+
+---
+
+## Phase 1: Define the 16 Hex-QAM Object in GRC
+
+Before building the flowgraphs, you must explicitly construct the hexagonal constellation array, as GNU Radio does not have a built-in hexagonal template.
+
+1. Add a **Constellation Object** block (under Digital -> Modulators).
+2. Set the ID to `hex_qam`.
+3. Set the layout to **User-Defined**.
+4. In the **Symbol Map**, enter a list of integers from `0` to `15`: `[0, 1, 2, ..., 15]`.
+5. In the **Constellation Points** field, you need to input 16 complex coordinates that map to an equilateral triangular lattice. You can generate a centered, normalized 16-Hex array by pasting this Python list directly into the field:
+
+```python
+[complex(x, y) for x, y in [(-1.5, 0.866), (-0.5, 0.866), (0.5, 0.866), (1.5, 0.866), (-2, 0), (-1, 0), (0, 0), (1, 0), (2, 0), (-1.5, -0.866), (-0.5, -0.866), (0.5, -0.866), (1.5, -0.866), (-1, -1.732), (0, -1.732), (1, -1.732)]]
+
+```
+
+*(Note: You can tweak or normalize these values using the object's normalization parameter so that average energy equals 1).*
+
+---
+
+## Phase 2: The Transmitter Flowgraph (TX)
+
+Keep this as simple as possible. No packet headers, no CRCs—just a continuous stream of bits.
+
+* **Random Source:** Type = Byte, Min = 0, Max = 255.
+* **Pack K Bits:** K = 4 (Since $2^4 = 16$ states for 16-QAM, this packs bits into chunks of 4 to feed the modulator).
+* **Constellation Modulator:** Set the Constellation Object to `hex_qam`. Set Samples per Symbol (SPS) = 4. Ensure "Differential" is turned **Off**.
+* **Rational Resampler:** Interpolate your symbol rate up to your desired USRP sample rate (e.g., from 250 kSym/s $\times$ 4 SPS = 1 MSps up to 2 MSps if needed).
+* **UHD: USRP Sink:** Set Master Clock Rate to something stable (like 20 MHz or 30 MHz), set the Sample Rate to 1 or 2 MSps, Center Freq = 2.5 GHz, and set your TX gain safely around 40–50 dB.
+
+---
+
+## Phase 3: The Receiver Flowgraph (RX)
+
+The receiver needs to progressively strip out channel impairments. To diagnose issues effectively, hook up a **QT GUI Constellation Sink** with multiple inputs so you can monitor the signal at different stages.
+
+* **UHD: USRP Source:** Match the Center Freq (2.5 GHz) and Sample Rate of the transmitter. Set RX gain to roughly 40 dB to start.
+* **AGC (Automatic Gain Control):** Crucial for QAM. Set the reference value to 1.0. This normalizes the amplitude so the inner and outer hex rings fall perfectly into place.
+* **FLL Band-Edge:** This corrects the coarse Carrier Frequency Offset (CFO) up to tens of kHz caused by the unlinked local oscillators.
+* **Symbol Sync:** Set your SPS to 4. Choose an algorithm like *Ted Mueller* or *Gardner*. This locks onto the symbol clock and outputs exactly 1 sample per symbol.
+* *Diagnostic Check:* Route the output of this block to Input 0 of your Constellation Sink. It will likely look like a set of spinning concentric circles because the residual phase/frequency offset hasn't been corrected yet.
+
+
+* **Digital Linear Equalizer:** Use a **CMA** (Constant Modulus Algorithm) or an **LMS** (Least Mean Squares) algorithm configured with your `hex_qam` object. This handles multipath channel distortion and acts as a fine phase tracker.
+* *Diagnostic Check:* Route this output to Input 1 of your Constellation Sink. This is where you should see the spinning circles snap into 16 distinct, stable hexagonal points.
+
+
+
+---
+
+## Phase 4: Step-by-Step Calibration Workflow
+
+To make sure you don't chase your tail troubleshooting code when the issue is actually hardware-related, follow this sequence:
+
+### 2. Going Over-The-Air (OTA)
+
+Once the wired test yields a pristine constellation, remove the cable, attach your 2.5 GHz antennas, and space the USRPs a few meters apart.
+
+* **Tweak Gains:** Watch the raw time-domain signal. Increase the USRP Source gain if the constellation points look tightly squashed near the origin, or lower it if the AGC is saturating.
+* **Tune the Equalizer Convergence:** Over the air, the equalizer has to work much harder. If the constellation circles are trying to form points but keep breaking or spinning, lower the **Gain / Convergence Step Size** of your LMS/CMA equalizer so it updates its tracking taps more smoothly.
+
+To get two independent USRP B210s to lock quickly over the air at 2.5 GHz, your receiver's control loops must be aggressively configured to handle up to 10 kHz of Carrier Frequency Offset (CFO) and arbitrary clock jitter.
+
+Here is the exact parameter blueprint for the **FLL Band-Edge**, **Symbol Sync**, and **Linear Equalizer** blocks in GNU Radio Companion to achieve a stable digital lock.
+
+---
+
+## 1. FLL Band-Edge Block Configuration
+
+The Frequency Locked Loop (FLL) operates on the principle that if the carrier is centered correctly, the power spectral density at the upper and lower transition edges of your Root Raised Cosine (RRC) spectrum will be perfectly equal. If the signal is spinning due to a 10 kHz drift, the FLL detects the power imbalance and pushes the signal back to baseband DC.
+
+| Parameter | Recommended Value | Engineering Rationale |
+| --- | --- | --- |
+| **Samples Per Symbol (SPS)** | `4` | Provides sufficient oversampling for the band-edge derivative filters to calculate power metrics accurately. |
+| **Rolloff Factor (Alpha)** | `0.35` | **Must exactly match** the excess bandwidth of the transmitter's RRC filter so the block knows where to place its edge filters. |
+| **Filter Size** | `45` or `55` | The number of taps for the internal band-edge filters. An odd value around 45 ensures a sharp, symmetric derivative profile without introducing too much loop delay. |
+| **Loop Bandwidth** | `0.02` | Controls loop convergence speed. At `0.02` (normalized digital frequency), the loop is wide enough to snap onto a 10 kHz offset within a few thousand symbols, yet narrow enough to avoid introducing massive phase noise. |
+
+---
+
+## 2. Symbol Sync Block Configuration
+
+The Symbol Sync block is a Second-Order Type-II Proportional-Integral (PI) control loop. Its job is to find the exact peak of the eye-diagram opening and downsample the stream from 4 SPS to a clean 1 sample per symbol.
+
+| Parameter | Recommended Value | Engineering Rationale |
+| --- | --- | --- |
+| **Timing Error Detector (TED)** | **Gardner (Non-Data-Aided)** | **Crucial Choice:** Because the 2.5 GHz carrier oscillators are unlinked, the constellation will still be spinning slightly when it enters this block. The Gardner algorithm is entirely immune to carrier phase rotation because it operates solely on amplitude transitions at the zero-crossings. |
+| **Samples Per Symbol** | `4` | Matches your incoming hardware oversampling rate. |
+| **Loop Bandwidth** | `0.03` | In GNU Radio, this input represents the normalized digital radian frequency ($\omega_n T_s$). Setting this to `0.03` equates to a tracking bandwidth of roughly 1.5% of your symbol rate—optimized to track out physical clock jitter dynamically over the air. |
+| **Damping Factor** | `1.0` | Setting this to `1.0` makes the loop **critically damped**. This completely prevents the timing tracker from overshooting or oscillating around the optimal sampling point when experiencing sudden burst noise. |
+| **Output SPS** | `1` | Drops the extra 3 samples, outputting only the single, perfect center-peaked sample per symbol directly to your equalizer. |
+
+---
+
+## 3. Fine Tuning Phase Tracking: Linear Equalizer
+
+Once the FLL stabilizes the bulk frequency drift and the Symbol Sync locks the clock timing, your 16 Hex-QAM points will stop spinning randomly but might still settle into one of several static phase rotations (phase ambiguity) or show slight multipath blurring.
+
+To clean this up, use the **Digital Linear Equalizer** block configured as follows:
+
+* **Algorithm:** **Decision-Directed LMS (Least Mean Squares)**
+* **Constellation Object:** Set this to your custom `hex_qam` object.
+* **Num Taps:** `15` (A small odd number of fractional taps is perfect for absorbing indoor multipath reflections).
+* **Gain (Step Size):** `0.0005` to `0.001`
+
+### Why Decision-Directed LMS?
+
+Because standard blind algorithms like CMA (Constant Modulus Algorithm) assume a single amplitude ring, they struggle to cleanly separate the complex inner and outer ring structures of a hexagonal 16-point grid.
+
+A Decision-Directed LMS equalizer looks at where a noisy symbol lands, maps it to the *nearest neighbor* point in your custom Hex-QAM array, calculates the exact phase/amplitude distance error, and updates its filter taps continuously to squeeze those 16 points into highly precise, stable coordinates on your QT GUI Constellation Sink.
+
+---
+
+## Verifying the Lock Sequence
+
+When you run your receiver flowgraph with a multi-input Constellation Sink hooked up at different points of the chain, you should look for this sequential behavior:
+
+1. **Post-FLL / Post-Sync Sink:** You should see 3 cleanly separated, concentric circles. This proves the FLL has eliminated the rapid spinning and the Symbol Sync has locked onto the correct timing metrics.
+2. **Post-Equalizer Sink:** The 3 circles should rapidly warp, break apart, and snap rigidly into 16 sharp, static hexagonal clusters.
+
+If your equalizer is failing to converge and the points are slowly drifting, try decreasing the USRP receiver gain by 3–5 dB; over-the-air amplification can sometimes saturate the AGC and distort the outer boundaries of the hexagonal lattice.
